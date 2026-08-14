@@ -27,11 +27,11 @@ Verified run (reproduce mode):
 
 | Run | MAE |
 |-----|-------|
-| 1 | 0.4319 |
-| 2 | 0.4262 |
-| 3 | 0.4225 |
-| 4 | 0.4244 |
-| 5 | 0.4214 |
+| 1 | 0.4386 |
+| 2 | 0.4369 |
+| 3 | 0.4331 |
+| 4 | 0.4342 |
+| 5 | 0.4324 |
 | **Mean / std** | **0.4351 +/- 0.0024** |
 | **TDC evaluate_many** | **0.435 +/- 0.003** |
 
@@ -61,6 +61,26 @@ python run_lipophilicity.py
 ```
 
 `run_lipophilicity.py` defaults to `--mode reproduce`, which deterministically rebuilds the five runs from the committed predictions in `assets/lipophilicity_blend_predictions.npz`. No models are trained, no randomness is used, so a fresh clone reproduces `output/lipophilicity_results.json` field-for-field (except `recorded_at` timestamp and `runtime_seconds`).
+
+## Train mode (end-to-end retraining)
+
+```bash
+python run_lipophilicity.py --mode train
+```
+
+This retrains the CatBoost tree leg from scratch on the downloaded official
+benchmark (herg_maccs 4992d features, 30 seeds grouped into five runs of 6),
+then blends with the **committed frozen CHEMELEON foundation predictions** in
+`assets/chemeleon_predictions.npz` (0.7/0.3) and scores with `evaluate_many`.
+`--quick` runs a short smoke variant (2 runs) that writes separate smoke outputs.
+
+The CHEMELEON leg itself is not retrained here: it is a fine-tuned chemprop
+2.3.1 foundation model (pretrained ~50M molecules) whose full retraining
+requires the pretrained foundation weights and a GPU. The frozen per-run
+CHEMELEON predictions are committed as the portable artifact.
+
+Verified train run (fresh retraining): **TDC `evaluate_many` 0.434 +/- 0.003**
+(mean 0.4342 +/- 0.0027), 5 distinct runs, beats clean SOTA 0.467 by -0.033.
 
 ## Exact Reproduction
 

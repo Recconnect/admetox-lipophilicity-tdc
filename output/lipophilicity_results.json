@@ -1,0 +1,37 @@
+{
+  "endpoint": "Lipophilicity_AstraZeneca",
+  "metric": "MAE",
+  "split": "official TDC scaffold split",
+  "sota": 0.467,
+  "protocol": "0.7*CHEMELEON + 0.3*trees; 5 runs",
+  "mode": "reproduce",
+  "quick": false,
+  "runs": 5,
+  "individual_mae": [
+    0.4385966218273755,
+    0.4369400301424495,
+    0.4330964875205289,
+    0.4342390428938826,
+    0.4323820108067689
+  ],
+  "mean_mae": 0.43505083863820104,
+  "std_mae": 0.002355536693826836,
+  "tdc_evaluate_many": {
+    "mean": 0.435,
+    "std": 0.003
+  },
+  "gap_to_sota": -0.03200000000000003,
+  "beat_sota": true,
+  "dataset_sha256": "6deb424a40039a04158fd2681e32a4d8bf990acc31b2162a8f69a3ffe495233a",
+  "environment": {
+    "python": "3.12.13",
+    "platform": "Windows-11-10.0.28000-SP0",
+    "numpy": "2.4.6",
+    "scikit_learn": "1.9.0",
+    "rdkit": "2026.03.4",
+    "catboost": "1.2.10",
+    "chemprop": "2.3.1"
+  },
+  "recorded_at": "2026-08-14T11:18:27.893902",
+  "runtime_seconds": 7.0395472049713135
+}

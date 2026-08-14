@@ -22,7 +22,7 @@ Leak audit:
 
 Usage:
   python run_lipophilicity.py                  # reproduce mode (default, deterministic)
-  python run_lipophilicity.py --mode train     # full end-to-end retraining
+  python run_lipophilicity.py --mode train     # retrain tree leg + blend with committed CHEMELEON leg
   python run_lipophilicity.py --quick          # installation smoke test
 """
 import argparse
@@ -63,6 +63,19 @@ ENDPOINT_TDC = "lipophilicity_astrazeneca"
 SOTA = 0.467  # Clean SOTA (Chemprop-RDKit)
 W_CHEM = 0.7
 W_TREE = 0.3
+N_RUNS = 5
+TREE_SEEDS = 30
+SEEDS_PER_RUN = 6
+TREE_PARAMS = {
+    'iterations': 1500,
+    'depth': 6,
+    'learning_rate': 0.05,
+    'l2_leaf_reg': 4.0,
+    'bagging_temperature': 0.9,
+    'random_strength': 1.0,
+    'verbose': 0,
+    'allow_writing_files': False,
+}
 
 
 def log(message):
@@ -184,8 +197,11 @@ def evaluate_and_save(runs, y_test, dataset_hash, quick, mode):
     mean, std = float(np.mean(per_run)), float(np.std(per_run))
 
     preds_list = [{name: p} for p in runs]
-    tdc_raw = group.evaluate_many(preds_list)
-    tdc_val, tdc_std = [float(v) for v in tdc_raw[name]]
+    if len(runs) < N_RUNS:
+        tdc_val, tdc_std = None, None
+    else:
+        tdc_raw = group.evaluate_many(preds_list)
+        tdc_val, tdc_std = [float(v) for v in tdc_raw[name]]
 
     result = {
         "endpoint": ENDPOINT,
@@ -199,9 +215,10 @@ def evaluate_and_save(runs, y_test, dataset_hash, quick, mode):
         "individual_mae": per_run,
         "mean_mae": mean,
         "std_mae": std,
-        "tdc_evaluate_many": {"mean": tdc_val, "std": tdc_std},
-        "gap_to_sota": tdc_val - SOTA,
-        "beat_sota": tdc_val < SOTA,
+        "tdc_evaluate_many": ({"mean": None, "std": None, "note": "null below 5 runs (TDC requirement); smoke mode uses reduced seeds"}
+                              if tdc_val is None else {"mean": tdc_val, "std": tdc_std}),
+        "gap_to_sota": (tdc_val - SOTA) if tdc_val is not None else None,
+        "beat_sota": (tdc_val < SOTA) if tdc_val is not None else None,
         "dataset_sha256": dataset_hash,
         "environment": environment_manifest(),
         "recorded_at": datetime.now().isoformat(),
@@ -217,7 +234,7 @@ def evaluate_and_save(runs, y_test, dataset_hash, quick, mode):
     )
 
     log("=" * 72)
-    log(f"TDC evaluate_many: {tdc_val:.3f} +/- {tdc_std:.3f}")
+    log(f"TDC evaluate_many: {tdc_val if tdc_val is None else f'{tdc_val:.3f} +/- {tdc_std:.3f}'}")
     log(f"Mean +/- Std:     {mean:.4f} +/- {std:.4f}")
     log(f"Gap to SOTA {SOTA:.3f}: {mean - SOTA:+.4f}")
     log(f"Beat SOTA:        {result['beat_sota']}")
@@ -274,15 +291,81 @@ def run_reproduce(args):
 # ---------------------------------------------------------------------------
 
 def run_train(args):
-    log("Train mode not yet implemented. Use reproduce mode.")
-    log("Full training requires chemprop 2.3.1 + CHEMELEON foundation model.")
+    started = time.time()
+    DATA_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    chem_path = ASSETS_DIR / "chemeleon_predictions.npz"
+    if not chem_path.exists():
+        raise FileNotFoundError(
+            f"Missing {chem_path}; the CHEMELEON leg is committed as frozen foundation "
+            "predictions (full chemprop retraining requires the pretrained ~50M-molecule "
+            "foundation model and a GPU)."
+        )
+    chem = np.load(chem_path)["predictions"]  # (5, 840) committed CHEMELEON runs
+
+    group = admet_group(path=str(DATA_DIR))
+    benchmark = group.get(ENDPOINT)
+    train_val, test = benchmark["train_val"], benchmark["test"]
+    tv_smiles = list(train_val["Drug"].values)
+    te_smiles = list(test["Drug"].values)
+    y_tv = train_val["Y"].values.astype(np.float64)
+    y_te = test["Y"].values.astype(np.float64)
+    digest = dataset_digest(tv_smiles, y_tv, te_smiles)
+    log(f"Dataset: train_val={len(y_tv)}, test={len(y_te)}, hash={digest[:16]}")
+
+    seeds = list(range(1, TREE_SEEDS + 1))
+    if args.quick:
+        seeds = seeds[:12]
+        log("QUICK SMOKE MODE: 12 tree seeds (2 runs); not the reported protocol")
+
+    log("Computing herg_maccs features...")
+    t0 = time.time()
+    X_tv = compute_herg_maccs(tv_smiles)
+    X_te = compute_herg_maccs(te_smiles)
+    log(f"  herg_maccs {X_tv.shape[1]}d [{time.time()-t0:.1f}s]")
+
+    import catboost as cb
+
+    tree_preds = np.zeros((len(seeds), len(te_smiles)), dtype=np.float64)
+    for si, seed in enumerate(seeds):
+        t0 = time.time()
+        params = {**TREE_PARAMS, 'random_seed': seed, 'thread_count': args.threads}
+        model = cb.CatBoostRegressor(**params)
+        model.fit(X_tv, y_tv)
+        tree_preds[si] = model.predict(X_te)
+        mae = float(mean_absolute_error(y_te, tree_preds[si]))
+        log(f"  tree seed {seed:2d}: MAE={mae:.4f} [{time.time()-t0:.1f}s]")
+
+    runs = []
+    n_runs = len(seeds) // SEEDS_PER_RUN
+    for r in range(n_runs):
+        idx = slice(r * SEEDS_PER_RUN, (r + 1) * SEEDS_PER_RUN)
+        tree_run = tree_preds[idx].mean(axis=0)
+        blend_run = W_CHEM * chem[r] + W_TREE * tree_run
+        runs.append(blend_run)
+
+    log("=" * 72)
+    log("ADMETox.AI: TDC Lipophilicity_AstraZeneca (train mode)")
+    log(f"Tree leg retrained from scratch (CatBoost, {len(seeds)} seeds);")
+    log("CHEMELEON leg = committed frozen foundation predictions")
+    log(f"Independent runs: {len(runs)}{' (TDC requires >=5)' if not args.quick else ' (quick smoke)'}")
+    log("=" * 72)
+
+    result = evaluate_and_save(runs, y_te, digest, args.quick, "train")
+    result["runtime_seconds"] = time.time() - started
+    out = OUTPUT_DIR / ("lipophilicity_smoke_results.json" if args.quick else "lipophilicity_results.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="End-to-end TDC Lipophilicity_AstraZeneca submission")
     parser.add_argument("--mode", choices=["reproduce", "train"], default="reproduce",
-                        help="reproduce: deterministic frozen legs (default); train: fresh end-to-end training")
-    parser.add_argument("--quick", action="store_true", help="installation smoke test")
+                        help="reproduce: deterministic frozen legs (default); train: fresh end-to-end retraining")
+    parser.add_argument("--threads", type=int, default=3,
+                        help="thread_count for GBM (train mode)")
+    parser.add_argument("--quick", action="store_true", help="installation smoke test; not the reported protocol")
     return parser.parse_args()
 
 
